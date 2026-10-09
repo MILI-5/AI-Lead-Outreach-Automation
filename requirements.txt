@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+pydantic-settings
+python-dotenv
+httpx
+python-multipart
+google-genai
+tzdata
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
