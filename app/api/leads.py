@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -14,8 +15,7 @@ from app.schemas.lead import LeadCreate, LeadResponse
 from app.schemas.meeting import MeetingCreate, MeetingResponse
 
 from app.services.lead_generator import create_lead
-from app.services.sample_leads import get_sample_leads
-from app.services.lead_deduplicator import lead_exists
+from app.services.free_company_discovery import discover_companies
 from app.services.ai_qualifier import AIQualifier
 from app.services.qualification_parser import parse_qualification
 from app.services.conversation_service import (
@@ -70,7 +70,6 @@ class TelegramChatIdUpdate(BaseModel):
 
 # -----------------------------
 # 1. Create a lead
-# POST /api/leads/
 # -----------------------------
 
 @router.post("/", response_model=LeadResponse)
@@ -83,7 +82,6 @@ def add_lead(
 
 # -----------------------------
 # 2. List leads
-# GET /api/leads/
 # -----------------------------
 
 @router.get("/")
@@ -92,60 +90,109 @@ def get_leads(db: Session = Depends(get_db)):
 
 
 # -----------------------------
-# 3. Discover sample leads
-# POST /api/leads/discover
+# 3. Discover company candidates
 # -----------------------------
 
 @router.post("/discover")
 def discover_leads(db: Session = Depends(get_db)):
-    sample_leads = get_sample_leads()
+    """Discover unverified company candidates from Hacker News."""
+    try:
+        candidates = discover_companies(limit=10)
+    except Exception as exc:
+        logger.exception("Free company discovery failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Company discovery failed. Please try again later.",
+        ) from exc
+
     created = []
     skipped = 0
+    failed = 0
 
-    for lead_data in sample_leads:
-        # Match the lead_exists(db, name, company_name) signature.
-        if lead_exists(
-            db=db,
-            name=lead_data.name,
-            company_name=lead_data.company_name,
+    for candidate in candidates:
+        company_name = (candidate.get("company_name") or "").strip()
+        website = (candidate.get("company_website") or "").strip().rstrip("/")
+
+        if (
+            not company_name
+            or not website
+            or not website.startswith(("https://", "http://"))
         ):
             skipped += 1
             continue
 
+        existing = (
+            db.query(Lead)
+            .filter(Lead.company_website == website)
+            .first()
+        )
+        if existing:
+            skipped += 1
+            continue
+
+        lead_data = LeadCreate(
+            name=candidate.get("name") or "Contact not identified",
+            designation=None,
+            company_name=company_name[:255],
+            company_website=website[:500],
+            linkedin_url=None,
+            instagram_url=None,
+            telegram_id=None,
+            email=None,
+            industry=candidate.get("industry") or "AI / Technology",
+            location=None,
+            business_requirement=(
+                "Potential prospect discovered from a public discussion. "
+                "Verify the company, website, decision-maker, and ICP fit "
+                "before contacting the prospect."
+            ),
+            company_size=None,
+            source="hacker_news",
+        )
+
         try:
             lead = create_lead(db=db, lead_data=lead_data)
-            created.append(
-                {
-                    "id": lead.id,
-                    "name": lead.name,
-                    "company_name": lead.company_name,
-                    "category": lead.category,
-                    "icp_score": lead.icp_score,
-                }
-            )
-        except Exception as exc:
+            created.append({
+                "id": lead.id,
+                "name": lead.name,
+                "company_name": lead.company_name,
+                "company_website": lead.company_website,
+                "industry": lead.industry,
+                "category": lead.category,
+                "icp_score": lead.icp_score,
+                "status": lead.status,
+                "source": lead.source,
+                "source_url": candidate.get("source_url"),
+                "verification_status": (
+                    candidate.get("verification_status") or "Unverified"
+                ),
+            })
+        except Exception:
             db.rollback()
-            logger.exception("Failed to create a sample lead")
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to save a discovered sample lead.",
-            ) from exc
+            failed += 1
+            logger.exception(
+                "Failed to save discovered candidate: %s",
+                company_name,
+            )
 
     return {
-        "message": "Sample lead discovery completed.",
+        "message": "Free company discovery completed.",
+        "discovered_count": len(candidates),
         "created_count": len(created),
-        "skipped_duplicates": skipped,
+        "skipped_duplicates_or_invalid": skipped,
+        "failed_count": failed,
         "leads": created,
         "note": (
-            "These are sample prospects for demonstration, "
-            "not verified live leads."
+            "Discovery results are unverified candidates, not confirmed "
+            "prospects. Verify company details and contact information "
+            "before outreach. Source URLs are not persisted in the "
+            "current Lead model."
         ),
     }
 
 
 # -----------------------------
 # 4. AI qualify a lead
-# POST /api/leads/{lead_id}/qualify
 # -----------------------------
 
 @router.post("/{lead_id}/qualify")
@@ -159,15 +206,32 @@ def qualify_lead(
         raise HTTPException(status_code=404, detail="Lead not found.")
 
     try:
-        # AIQualifier defines qualify_lead(), not qualify().
         raw_result = AIQualifier().qualify_lead(lead)
         parsed = parse_qualification(raw_result)
 
-        lead.category = parsed.get("category", lead.category)
-        lead.buying_intent = parsed.get("buying_intent")
-        lead.pain_points = parsed.get("pain_points")
-        lead.ai_summary = parsed.get("summary")
-        lead.status = lead.category
+        # Qualification fields and workflow status are separate.
+        # Never set lead.status from lead.category here.
+        category = parsed.get("category")
+        if category:
+            allowed_categories = {
+                "Qualified",
+                "Potential",
+                "Not Qualified",
+            }
+            if category not in allowed_categories:
+                raise ValueError(
+                    f"Unexpected qualification category: {category}"
+                )
+            lead.category = category
+
+        if "buying_intent" in parsed:
+            lead.buying_intent = parsed["buying_intent"]
+
+        if "pain_points" in parsed:
+            lead.pain_points = parsed["pain_points"]
+
+        if "summary" in parsed:
+            lead.ai_summary = parsed["summary"]
 
         db.commit()
         db.refresh(lead)
@@ -175,6 +239,7 @@ def qualify_lead(
         return {
             "lead_id": lead.id,
             "category": lead.category,
+            "status": lead.status,
             "buying_intent": lead.buying_intent,
             "pain_points": lead.pain_points,
             "summary": lead.ai_summary,
@@ -182,16 +247,15 @@ def qualify_lead(
 
     except Exception as exc:
         db.rollback()
-        logger.exception("Lead qualification failed for lead %s", lead_id)
+        logger.exception("Qualification failed for lead %s", lead_id)
         raise HTTPException(
             status_code=500,
-            detail=f"Lead qualification failed: {exc}",
+            detail="Lead qualification failed. Check the backend logs.",
         ) from exc
 
 
 # -----------------------------
 # 5. Save a conversation message
-# POST /api/leads/{lead_id}/messages
 # -----------------------------
 
 @router.post("/{lead_id}/messages")
@@ -201,27 +265,32 @@ def add_message(
     db: Session = Depends(get_db),
 ):
     lead = db.query(Lead).filter(Lead.id == lead_id).first()
-
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found.")
 
-    message = save_message(
-        db=db,
-        lead_id=lead_id,
-        role=message_data.role,
-        message=message_data.message,
-    )
-
-    return {
-        "message": "Conversation message saved.",
-        "id": message.id,
-        "lead_id": lead_id,
-    }
+    try:
+        message = save_message(
+            db=db,
+            lead_id=lead_id,
+            role=message_data.role,
+            message=message_data.message,
+        )
+        return {
+            "message": "Conversation message saved.",
+            "id": message.id,
+            "lead_id": lead_id,
+        }
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Failed to save message for lead %s", lead_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to save conversation message.",
+        ) from exc
 
 
 # -----------------------------
 # 6. Get conversation history
-# GET /api/leads/{lead_id}/messages
 # -----------------------------
 
 @router.get("/{lead_id}/messages")
@@ -229,13 +298,10 @@ def list_messages(
     lead_id: int,
     db: Session = Depends(get_db),
 ):
-    lead = db.query(Lead).filter(Lead.id == lead_id).first()
-
-    if not lead:
+    if not db.query(Lead.id).filter(Lead.id == lead_id).first():
         raise HTTPException(status_code=404, detail="Lead not found.")
 
     history = get_conversation_history(db=db, lead_id=lead_id)
-
     return {
         "lead_id": lead_id,
         "message_count": len(history),
@@ -245,7 +311,6 @@ def list_messages(
 
 # -----------------------------
 # 7. Chat with the AI
-# POST /api/leads/{lead_id}/chat
 # -----------------------------
 
 @router.post("/{lead_id}/chat")
@@ -255,7 +320,6 @@ def chat_with_lead(
     db: Session = Depends(get_db),
 ):
     lead = db.query(Lead).filter(Lead.id == lead_id).first()
-
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found.")
 
@@ -269,24 +333,29 @@ def chat_with_lead(
 
         reply = LeadChatbot().reply(db=db, lead=lead)
 
+        save_message(
+            db=db,
+            lead_id=lead_id,
+            role="assistant",
+            message=reply,
+        )
+
         return {
             "lead_id": lead_id,
             "user_message": chat_data.message,
             "ai_reply": reply,
         }
-
     except Exception as exc:
         db.rollback()
         logger.exception("AI conversation failed for lead %s", lead_id)
         raise HTTPException(
             status_code=500,
-            detail=f"AI conversation failed: {exc}",
+            detail="AI conversation failed. Check the backend logs.",
         ) from exc
 
 
 # -----------------------------
-# 8. Preview an outreach message
-# POST /api/leads/{lead_id}/outreach/preview
+# 8. Preview outreach
 # -----------------------------
 
 @router.post("/{lead_id}/outreach/preview")
@@ -295,31 +364,27 @@ def preview_outreach(
     db: Session = Depends(get_db),
 ):
     lead = db.query(Lead).filter(Lead.id == lead_id).first()
-
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found.")
 
     try:
         message = OutreachService().generate_message(lead)
-
         return {
             "lead_id": lead_id,
             "channel": "telegram",
             "message": message,
             "status": "Draft",
         }
-
     except Exception as exc:
         logger.exception("Outreach generation failed for lead %s", lead_id)
         raise HTTPException(
             status_code=500,
-            detail=f"Outreach generation failed: {exc}",
+            detail="Outreach generation failed. Check the backend logs.",
         ) from exc
 
 
 # -----------------------------
-# 9. Save an outreach draft
-# POST /api/leads/{lead_id}/outreach
+# 9. Save outreach draft
 # -----------------------------
 
 @router.post("/{lead_id}/outreach")
@@ -328,30 +393,34 @@ def add_outreach(
     outreach_data: OutreachCreate,
     db: Session = Depends(get_db),
 ):
-    lead = db.query(Lead).filter(Lead.id == lead_id).first()
-
-    if not lead:
+    if not db.query(Lead.id).filter(Lead.id == lead_id).first():
         raise HTTPException(status_code=404, detail="Lead not found.")
 
-    outreach = create_outreach(
-        db=db,
-        lead_id=lead_id,
-        channel=outreach_data.channel,
-        message=outreach_data.message,
-    )
-
-    return {
-        "message": "Outreach draft saved.",
-        "outreach_id": outreach.id,
-        "lead_id": lead_id,
-        "channel": outreach.channel,
-        "status": outreach.status,
-    }
+    try:
+        outreach = create_outreach(
+            db=db,
+            lead_id=lead_id,
+            channel=outreach_data.channel,
+            message=outreach_data.message,
+        )
+        return {
+            "message": "Outreach draft saved.",
+            "outreach_id": outreach.id,
+            "lead_id": lead_id,
+            "channel": outreach.channel,
+            "status": outreach.status,
+        }
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Failed to save outreach for lead %s", lead_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to save outreach draft.",
+        ) from exc
 
 
 # -----------------------------
 # 10. Get outreach history
-# GET /api/leads/{lead_id}/outreach
 # -----------------------------
 
 @router.get("/{lead_id}/outreach")
@@ -359,13 +428,10 @@ def list_outreach(
     lead_id: int,
     db: Session = Depends(get_db),
 ):
-    lead = db.query(Lead).filter(Lead.id == lead_id).first()
-
-    if not lead:
+    if not db.query(Lead.id).filter(Lead.id == lead_id).first():
         raise HTTPException(status_code=404, detail="Lead not found.")
 
     history = get_outreach_history(db=db, lead_id=lead_id)
-
     return {
         "lead_id": lead_id,
         "outreach_count": len(history),
@@ -375,7 +441,6 @@ def list_outreach(
 
 # -----------------------------
 # 11. Update outreach status
-# PATCH /api/leads/outreach/{outreach_id}
 # -----------------------------
 
 @router.patch("/outreach/{outreach_id}")
@@ -389,23 +454,22 @@ def update_outreach_status(
         .filter(Outreach.id == outreach_id)
         .first()
     )
-
     if not outreach:
         raise HTTPException(
             status_code=404,
             detail="Outreach record not found.",
         )
 
-    outreach.status = update_data.status
-
-    if update_data.response is not None:
-        outreach.response = update_data.response
-
     try:
+        outreach.status = update_data.status
+        if update_data.response is not None:
+            outreach.response = update_data.response
+
         db.commit()
         db.refresh(outreach)
     except Exception as exc:
         db.rollback()
+        logger.exception("Failed to update outreach %s", outreach_id)
         raise HTTPException(
             status_code=500,
             detail="Failed to update outreach status.",
@@ -421,7 +485,6 @@ def update_outreach_status(
 
 # -----------------------------
 # 12. Send Telegram outreach
-# POST /api/leads/{lead_id}/outreach/send-telegram
 # -----------------------------
 
 @router.post("/{lead_id}/outreach/send-telegram")
@@ -430,7 +493,6 @@ async def send_telegram_outreach(
     db: Session = Depends(get_db),
 ):
     lead = db.query(Lead).filter(Lead.id == lead_id).first()
-
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found.")
 
@@ -442,7 +504,6 @@ async def send_telegram_outreach(
 
     try:
         message = OutreachService().generate_message(lead)
-
         telegram_result = await TelegramService().send_message(
             chat_id=lead.telegram_id,
             message=message,
@@ -454,7 +515,6 @@ async def send_telegram_outreach(
             channel="telegram",
             message=message,
         )
-
         outreach.status = "Sent"
         db.commit()
         db.refresh(outreach)
@@ -466,19 +526,17 @@ async def send_telegram_outreach(
             "status": outreach.status,
             "telegram_message_id": telegram_result.get("message_id"),
         }
-
     except Exception as exc:
         db.rollback()
         logger.exception("Telegram outreach failed for lead %s", lead_id)
         raise HTTPException(
             status_code=500,
-            detail=f"Telegram outreach failed: {exc}",
+            detail="Telegram outreach failed. Check the backend logs.",
         ) from exc
 
 
 # -----------------------------
 # 13. Telegram webhook
-# POST /api/leads/telegram/webhook
 # -----------------------------
 
 @router.post("/telegram/webhook")
@@ -493,13 +551,12 @@ async def telegram_webhook(
         logger.exception("Failed to process Telegram update")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to process Telegram update: {exc}",
+            detail="Failed to process Telegram update.",
         ) from exc
 
 
 # -----------------------------
-# 14. Save a lead's Telegram chat ID
-# PATCH /api/leads/{lead_id}/telegram-id
+# 14. Save Telegram chat ID
 # -----------------------------
 
 @router.patch("/{lead_id}/telegram-id")
@@ -509,15 +566,10 @@ def update_telegram_chat_id(
     db: Session = Depends(get_db),
 ):
     lead = db.query(Lead).filter(Lead.id == lead_id).first()
-
     if not lead:
-        raise HTTPException(
-            status_code=404,
-            detail="Lead not found.",
-        )
+        raise HTTPException(status_code=404, detail="Lead not found.")
 
     telegram_id = payload.telegram_id.strip()
-
     if not telegram_id:
         raise HTTPException(
             status_code=422,
@@ -530,10 +582,7 @@ def update_telegram_chat_id(
         db.refresh(lead)
     except Exception as exc:
         db.rollback()
-        logger.exception(
-            "Failed to save Telegram chat ID for lead %s",
-            lead_id,
-        )
+        logger.exception("Failed to save Telegram chat ID for lead %s", lead_id)
         raise HTTPException(
             status_code=500,
             detail="Failed to save Telegram chat ID.",
@@ -566,28 +615,34 @@ def get_available_slot_times(
 
     for day_offset in range(7):
         day = now.date() + timedelta(days=day_offset)
-
-        # Monday to Friday only.
         if day.weekday() >= 5:
             continue
 
-        # Half-hour start times, 10:00 AM to 4:30 PM.
         for minute_of_day in range(600, 991, 30):
-            hour = minute_of_day // 60
-            minute = minute_of_day % 60
-
+            hour, minute = divmod(minute_of_day, 60)
             slot = datetime.combine(day, time(hour, minute))
             slot_end = slot + timedelta(minutes=duration_minutes)
 
             if slot <= now:
                 continue
 
-            conflict = any(
-                slot < meeting.meeting_time
-                + timedelta(minutes=meeting.duration_minutes)
-                and slot_end > meeting.meeting_time
-                for meeting in existing_meetings
-            )
+            conflict = False
+            for meeting in existing_meetings:
+                existing_start = meeting.meeting_time
+
+                if existing_start.tzinfo is not None:
+                    existing_start = (
+                        existing_start.astimezone(timezone)
+                        .replace(tzinfo=None)
+                    )
+
+                existing_end = existing_start + timedelta(
+                    minutes=meeting.duration_minutes
+                )
+
+                if slot < existing_end and slot_end > existing_start:
+                    conflict = True
+                    break
 
             if not conflict:
                 available_slots.append(slot)
@@ -596,28 +651,21 @@ def get_available_slot_times(
 
 
 # -----------------------------
-# 15. List available meeting slots
-# GET /api/leads/meetings/slots
+# 15. List meeting slots
 # -----------------------------
 
 @router.get("/meetings/slots")
-def list_meeting_slots(
-    db: Session = Depends(get_db),
-):
+def list_meeting_slots(db: Session = Depends(get_db)):
     slots = get_available_slot_times(db=db)
-
     return {
         "timezone": settings.default_timezone,
         "duration_minutes": 30,
-        "available_slots": [
-            slot.isoformat() for slot in slots
-        ],
+        "available_slots": [slot.isoformat() for slot in slots],
     }
 
 
 # -----------------------------
 # 16. Book a meeting
-# POST /api/leads/meetings/book
 # -----------------------------
 
 @router.post("/meetings/book", response_model=MeetingResponse)
@@ -625,23 +673,18 @@ async def book_meeting(
     meeting_data: MeetingCreate,
     db: Session = Depends(get_db),
 ):
-    lead = db.query(Lead).filter(
-        Lead.id == meeting_data.lead_id
-    ).first()
-
+    lead = (
+        db.query(Lead)
+        .filter(Lead.id == meeting_data.lead_id)
+        .first()
+    )
     if not lead:
-        raise HTTPException(
-            status_code=404,
-            detail="Lead not found.",
-        )
+        raise HTTPException(status_code=404, detail="Lead not found.")
 
     if meeting_data.timezone != settings.default_timezone:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Use the configured timezone: "
-                f"{settings.default_timezone}"
-            ),
+            detail=f"Use the configured timezone: {settings.default_timezone}",
         )
 
     timezone = ZoneInfo(settings.default_timezone)
@@ -654,7 +697,6 @@ async def book_meeting(
         )
 
     now = datetime.now(timezone).replace(tzinfo=None)
-
     if meeting_time <= now:
         raise HTTPException(
             status_code=400,
@@ -665,14 +707,10 @@ async def book_meeting(
         db=db,
         duration_minutes=meeting_data.duration_minutes,
     )
-
     if meeting_time not in available_slots:
         raise HTTPException(
             status_code=409,
-            detail=(
-                "This slot is unavailable. Fetch available slots "
-                "and try again."
-            ),
+            detail="This slot is unavailable. Fetch available slots and try again.",
         )
 
     meeting = Meeting(
@@ -696,47 +734,30 @@ async def book_meeting(
         logger.exception("Meeting booking failed")
         raise HTTPException(
             status_code=500,
-            detail=f"Meeting booking failed: {exc}",
+            detail="Meeting booking failed.",
         ) from exc
 
-    # Create a Google Calendar event after saving the booking.
-    # Calendar failure does not cancel the database booking.
+    # Calendar integration is best-effort; keep the database booking.
     try:
         calendar_event = create_calendar_event(meeting)
-
         if (
             not meeting.meeting_link
+            and calendar_event
             and calendar_event.get("html_link")
         ):
             meeting.meeting_link = calendar_event["html_link"]
             db.commit()
             db.refresh(meeting)
-
-        logger.info(
-            "Google Calendar event created for meeting %s "
-            "(event ID: %s)",
-            meeting.id,
-            calendar_event.get("event_id"),
-        )
-
     except Exception:
         db.rollback()
         logger.exception(
-            "Google Calendar sync failed for meeting %s. "
-            "The database booking remains saved.",
+            "Calendar sync failed for meeting %s; local booking remains saved.",
             meeting.id,
         )
 
-    # Send meeting confirmation through Telegram.
-    if not lead.telegram_id:
-        logger.warning(
-            "Meeting %s booked, but Telegram confirmation was skipped: "
-            "lead %s has no Telegram chat ID.",
-            meeting.id,
-            lead.id,
-        )
-    else:
-        confirmation_message = (
+    # Send Telegram confirmation only if a chat ID is available.
+    if lead.telegram_id:
+        confirmation = (
             f"Hi {lead.name or 'there'}, your meeting has been scheduled!\n\n"
             f"Meeting: {meeting.meeting_title}\n"
             f"Date and time: "
@@ -744,28 +765,17 @@ async def book_meeting(
             f"({meeting.timezone})\n"
             f"Duration: {meeting.duration_minutes} minutes\n"
         )
-
         if meeting.meeting_link:
-            confirmation_message += (
-                f"\nCalendar event: {meeting.meeting_link}"
-            )
+            confirmation += f"\nCalendar event: {meeting.meeting_link}"
 
         try:
-            telegram_result = await TelegramService().send_message(
+            await TelegramService().send_message(
                 chat_id=lead.telegram_id,
-                message=confirmation_message,
+                message=confirmation,
             )
-
-            logger.info(
-                "Telegram confirmation sent for meeting %s; "
-                "message ID: %s",
-                meeting.id,
-                telegram_result.get("message_id"),
-            )
-
         except Exception:
             logger.exception(
-                "Meeting %s was booked, but Telegram confirmation failed.",
+                "Meeting %s booked, but Telegram confirmation failed.",
                 meeting.id,
             )
 
@@ -774,25 +784,102 @@ async def book_meeting(
 
 # -----------------------------
 # 17. Retrieve a meeting
-# GET /api/leads/meetings/{meeting_id}
 # -----------------------------
 
-@router.get(
-    "/meetings/{meeting_id}",
-    response_model=MeetingResponse,
-)
+@router.get("/meetings/{meeting_id}", response_model=MeetingResponse)
 def get_meeting(
     meeting_id: int,
     db: Session = Depends(get_db),
 ):
-    meeting = db.query(Meeting).filter(
-        Meeting.id == meeting_id
-    ).first()
-
+    meeting = (
+        db.query(Meeting)
+        .filter(Meeting.id == meeting_id)
+        .first()
+    )
     if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found.")
+    return meeting
+
+
+# -----------------------------
+# 18. List all meetings
+# -----------------------------
+
+@router.get("/meetings")
+def list_all_meetings(db: Session = Depends(get_db)):
+    scheduled_count = (
+        db.query(func.count(Meeting.id))
+        .filter(Meeting.status == "Scheduled")
+        .scalar()
+        or 0
+    )
+
+    meetings = (
+        db.query(Meeting)
+        .order_by(Meeting.meeting_time.asc(), Meeting.id.asc())
+        .all()
+    )
+
+    return {
+        "meeting_count": scheduled_count,
+        "total_meeting_count": len(meetings),
+        "meetings": [
+            {
+                "id": meeting.id,
+                "lead_id": meeting.lead_id,
+                "meeting_title": meeting.meeting_title,
+                "meeting_time": (
+                    meeting.meeting_time.isoformat()
+                    if meeting.meeting_time
+                    else None
+                ),
+                "duration_minutes": meeting.duration_minutes,
+                "timezone": meeting.timezone,
+                "status": meeting.status,
+                "meeting_link": meeting.meeting_link,
+            }
+            for meeting in meetings
+        ],
+    }
+
+
+# One-time correction for a lead whose workflow status was overwritten.
+@router.patch("/{lead_id}/restore-workflow-status")
+def restore_workflow_status(
+    lead_id: int,
+    db: Session = Depends(get_db),
+):
+    lead = db.query(Lead).filter(Lead.id == lead_id).first()
+
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found.")
+
+    # Only restore discovery candidates currently marked Potential.
+    if (
+        lead.source != "hacker_news"
+        or lead.status != "Potential"
+    ):
         raise HTTPException(
-            status_code=404,
-            detail="Meeting not found.",
+            status_code=409,
+            detail="Lead does not match the expected correction conditions.",
         )
 
-    return meeting
+    lead.status = "New"
+
+    try:
+        db.commit()
+        db.refresh(lead)
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Failed to restore lead workflow status")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to restore workflow status.",
+        ) from exc
+
+    return {
+        "lead_id": lead.id,
+        "category": lead.category,
+        "status": lead.status,
+        "message": "Workflow status restored to New.",
+    }
